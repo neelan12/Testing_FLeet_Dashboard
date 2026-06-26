@@ -8,11 +8,9 @@ import io
 today_str = datetime.now().strftime("%d-%m-%Y")
 new_filename = f"Fleet Dashboard {today_str}.xlsx"
 
-# Output folder (GitHub Actions default = Fleet_Dashboard_Files)
 destination_folder = os.environ.get('DOWNLOAD_PATH', 'Fleet_Dashboard_Files')
 final_path = os.path.join(destination_folder, new_filename)
 
-# Delete file if it exists
 os.makedirs(destination_folder, exist_ok=True)
 if os.path.exists(final_path):
     os.remove(final_path)
@@ -20,7 +18,7 @@ if os.path.exists(final_path):
 
 
 def solve_captcha(page):
-    """Extract captcha alphanumeric text from DOM/canvas/image using OCR."""
+    """Extract captcha alphanumeric text from canvas/image using OCR."""
     from PIL import Image, ImageEnhance, ImageFilter
     import pytesseract
 
@@ -34,7 +32,7 @@ def solve_captcha(page):
         text = pytesseract.image_to_string(img, config=ocr_config).strip()
         return ''.join(c for c in text if c.isalnum())
 
-    # Method 1: Canvas-based captcha (common on Angular/SPA sites)
+    # Method 1: Canvas-based captcha
     try:
         canvases = page.evaluate("""
             () => {
@@ -49,40 +47,35 @@ def solve_captcha(page):
             img = Image.open(io.BytesIO(img_data))
             text = preprocess_and_ocr(img)
             if text:
-                print(f"📸 Captcha solved via canvas OCR: {text}")
+                print(f"📸 Captcha via canvas OCR: {text}")
                 return text
     except Exception as e:
         print(f"Canvas method failed: {e}")
 
-    # Method 2: Captcha image element screenshot + OCR
-    try:
-        captcha_selectors = [
-            "img[src*='captcha']",
-            "img[id*='captcha']",
-            "img[class*='captcha']",
-            "img[alt*='captcha']",
-            ".captcha img",
-            "#captchaImage",
-            "app-captcha img",
-            "[formcontrolname='captcha'] ~ img",
-            "[formcontrolname='captcha'] + span img",
-        ]
-        for selector in captcha_selectors:
-            try:
-                el = page.locator(selector).first
-                if el.count() > 0 and el.is_visible(timeout=3000):
-                    screenshot_bytes = el.screenshot()
-                    img = Image.open(io.BytesIO(screenshot_bytes))
-                    text = preprocess_and_ocr(img)
-                    if text:
-                        print(f"📸 Captcha solved via image OCR ({selector}): {text}")
-                        return text
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"Image OCR method failed: {e}")
+    # Method 2: Captcha image element screenshot
+    captcha_selectors = [
+        ".captcha img",
+        "img[src*='captcha']",
+        "img[id*='captcha']",
+        "img[class*='captcha']",
+        "img[alt*='captcha']",
+        "#captchaImage",
+        "app-captcha img",
+    ]
+    for selector in captcha_selectors:
+        try:
+            el = page.locator(selector).first
+            if el.count() > 0 and el.is_visible(timeout=3000):
+                screenshot_bytes = el.screenshot()
+                img = Image.open(io.BytesIO(screenshot_bytes))
+                text = preprocess_and_ocr(img)
+                if text:
+                    print(f"📸 Captcha via image OCR ({selector}): {text}")
+                    return text
+        except Exception:
+            continue
 
-    # Method 3: Fallback - original DOM text extraction
+    # Method 3: DOM text fallback
     try:
         text = page.inner_text("span.input-group-addon", timeout=10000).strip()
         text = ''.join(c for c in text if c.isalnum())
@@ -95,6 +88,39 @@ def solve_captcha(page):
     raise Exception("❌ Could not solve captcha - all methods failed")
 
 
+def try_login(page, password, attempt=1):
+    """Attempt login and verify it succeeded. Returns True on success."""
+    print(f"🔢 Solving captcha (attempt {attempt})...")
+
+    # Re-fill credentials in case page refreshed
+    page.fill("input[name='UserName']", "neelan.ibi")
+    page.fill("input[id='password']", password)
+
+    captcha_text = solve_captcha(page)
+    page.fill("input[formcontrolname='captcha']", captcha_text)
+    page.click("button:has-text('Login')")
+
+    # Wait for page to settle after clicking login
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(2000)
+
+    # Check if login actually succeeded by looking for post-login elements
+    # If still on login page, login failed
+    still_on_login = False
+    try:
+        if page.locator("input[name='UserName']").is_visible(timeout=3000):
+            still_on_login = True
+    except Exception:
+        pass
+
+    if still_on_login:
+        print(f"❌ Login attempt {attempt} failed (wrong captcha or credentials)")
+        return False
+
+    print(f"✅ Login successful on attempt {attempt}")
+    return True
+
+
 def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -103,27 +129,55 @@ def main():
         page.set_default_timeout(60000)
 
         try:
-            # Step 1: Login
+            # Step 1: Navigate to site
             print("🔐 Logging in...")
             page.goto("https://mtcbusits.in/")
             page.wait_for_load_state("networkidle")
             print("✅ Page fully loaded")
 
-            page.fill("input[name='UserName']", "neelan.ibi")
             password = os.environ.get('LOGIN_PASSWORD', 'Neelan@123')
-            page.fill("input[id='password']", password)
 
-            print("🔢 Solving captcha...")
-            captcha_text = solve_captcha(page)
-            page.fill("input[formcontrolname='captcha']", captcha_text)
-            page.click("button:has-text('Login')")
-            page.wait_for_timeout(3000)
-            print("✅ Login successful")
+            # Retry login up to 3 times (in case OCR misreads captcha)
+            logged_in = False
+            for attempt in range(1, 4):
+                if try_login(page, password, attempt):
+                    logged_in = True
+                    break
+                if attempt < 3:
+                    print(f"🔄 Retrying login... reloading page to get fresh captcha")
+                    page.reload()
+                    page.wait_for_load_state("networkidle")
 
-            # Step 2: Go to AVLS section
+            if not logged_in:
+                raise Exception("❌ All 3 login attempts failed - check credentials or captcha")
+
+            # Step 2: Navigate to AVLS section
             print("📊 Navigating to AVLS section...")
-            page.click("p:has-text('AVLS')")
+            avls_selectors = [
+                "p:has-text('AVLS')",
+                "a:has-text('AVLS')",
+                "span:has-text('AVLS')",
+                "li:has-text('AVLS')",
+                "div:has-text('AVLS')",
+                "[class*='menu'] :has-text('AVLS')",
+            ]
+            avls_clicked = False
+            for selector in avls_selectors:
+                try:
+                    el = page.locator(selector).first
+                    if el.count() > 0 and el.is_visible(timeout=5000):
+                        el.click()
+                        avls_clicked = True
+                        print(f"✅ Clicked AVLS via: {selector}")
+                        break
+                except Exception:
+                    continue
 
+            if not avls_clicked:
+                page.screenshot(path="avls_not_found.png")
+                raise Exception("❌ Could not find AVLS navigation element - page structure may have changed")
+
+            # Wait until spinner disappears
             print("⏳ Waiting for AVLS data to load...")
             page.locator("#nb-global-spinner").wait_for(state="hidden", timeout=60000)
             print("✅ AVLS section loaded")
