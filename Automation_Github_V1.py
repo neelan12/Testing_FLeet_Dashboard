@@ -16,6 +16,27 @@ if os.path.exists(final_path):
     os.remove(final_path)
     print(f"🗑️ Existing file deleted: {final_path}")
 
+DEBUG_DIR = "captcha_debug"
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+
+def save_debug_captcha_images(page, attempt):
+    """Save every data:image element on the page so we can see what the OCR is actually reading."""
+    imgs = page.query_selector_all('img[src^="data:image"]')
+    print(f"🔍 Found {len(imgs)} data:image element(s) on page (attempt {attempt})")
+    for idx, img in enumerate(imgs):
+        try:
+            src = img.get_attribute("src")
+            if not src:
+                continue
+            img_bytes = base64.b64decode(src.split(",")[1])
+            out_path = os.path.join(DEBUG_DIR, f"attempt{attempt}_img{idx}.png")
+            with open(out_path, "wb") as f:
+                f.write(img_bytes)
+            print(f"   💾 Saved {out_path} ({len(img_bytes)} bytes)")
+        except Exception as e:
+            print(f"   ⚠️ Could not save image {idx}: {e}")
+
 
 def main():
     import easyocr
@@ -33,24 +54,32 @@ def main():
             page.goto("https://mtcbusits.in/")
             page.wait_for_load_state("networkidle")
             print("✅ Page fully loaded")
+            page.screenshot(path=os.path.join(DEBUG_DIR, "full_page_before_login.png"), full_page=True)
 
             page.fill("input[name='UserName']", "neelan.ibi")
             password = os.environ.get('LOGIN_PASSWORD', 'Neelan@123')
             page.fill("input[id='password']", password)
 
             logged_in = False
-            for attempt in range(15):
-                # Read captcha from base64 inline image src (as in working local script)
-                captcha_img_src = page.get_attribute('img[src^="data:image"]', "src")
+            for attempt in range(1, 16):
+                # Save every data:image element for debugging (first 3 attempts only, to limit artifact size)
+                if attempt <= 3:
+                    save_debug_captcha_images(page, attempt)
+
+                # Read captcha from base64 inline image src (last matching image, in case
+                # earlier data:image elements on the page are logos/icons, not the captcha)
+                imgs = page.query_selector_all('img[src^="data:image"]')
+                captcha_img_src = imgs[-1].get_attribute("src") if imgs else None
+
                 if captcha_img_src and captcha_img_src.startswith("data:image"):
                     image_data = base64.b64decode(captcha_img_src.split(",")[1])
                     result = reader.readtext(image_data, detail=0, mag_ratio=2)
                     captcha = re.sub(r'[^A-Za-z0-9]', '', "".join(result).strip())
-                    print(f"🔢 CAPTCHA via easyocr (attempt {attempt+1}): {captcha}")
+                    print(f"🔢 CAPTCHA via easyocr (attempt {attempt}, img_count={len(imgs)}): {captcha}")
                 else:
                     captcha = page.inner_text("span.input-group-addon").strip()
                     captcha = re.sub(r'[^A-Za-z0-9]', '', captcha)
-                    print(f"🔢 CAPTCHA via DOM text (attempt {attempt+1}): {captcha}")
+                    print(f"🔢 CAPTCHA via DOM text (attempt {attempt}): {captcha}")
 
                 page.fill("input[formcontrolname='captcha']", captcha)
                 page.click("button:has-text('Login')")
@@ -62,17 +91,18 @@ def main():
                         break
 
                 if "login" not in page.url and page.url != "https://mtcbusits.in/":
-                    print(f"✅ Login successful on attempt {attempt+1}!")
+                    print(f"✅ Login successful on attempt {attempt}!")
                     logged_in = True
                     break
 
-                print(f"❌ OCR guessed wrong (attempt {attempt+1}/15). Refreshing captcha...")
+                print(f"❌ OCR guessed wrong (attempt {attempt}/15). Refreshing captcha...")
                 try:
                     old_src = captcha_img_src
                     page.locator(".k-i-reload").click(timeout=1000)
                     for _ in range(25):
                         page.wait_for_timeout(200)
-                        new_src = page.get_attribute('img[src^="data:image"]', "src")
+                        new_imgs = page.query_selector_all('img[src^="data:image"]')
+                        new_src = new_imgs[-1].get_attribute("src") if new_imgs else None
                         if new_src and new_src != old_src:
                             break
                 except Exception:
