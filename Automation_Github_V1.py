@@ -2,11 +2,15 @@
 """
 MTC Bus ITS Portal - Fleet Dashboard Downloader (GitHub Actions)
 ================================================================
-Uses the exact login/captcha pattern from the verified working local
-script, but runs a HEADED browser under Xvfb so the client-side canvas
-captcha renders with real fonts (headless Chromium renders it badly and
-easyOCR then fails). After login it navigates to AVLS, searches for the
-Fleet Dashboard report and exports the Excel file.
+Runs a HEADED browser under Xvfb so the client-side canvas captcha renders
+with real fonts, reads it with easyOCR (same pattern as the working local
+script), logs in, opens AVLS, searches the Fleet Dashboard report and exports
+the Excel file.
+
+NOTE: the login password comes from the LOGIN_PASSWORD env var, but falls back
+to the hardcoded default if that var is missing OR empty (an unset GitHub
+secret is injected as an empty string, which previously blanked the password
+field and caused every login to fail with 'Username and Password Required').
 """
 
 import sys
@@ -20,6 +24,8 @@ from playwright.sync_api import sync_playwright
 
 # ── CONFIG ───────────────────────────────────────────────────
 USERNAME = "neelan.ibi"
+# Empty env var must fall back to the default -> use `or`, NOT os.environ.get default
+PASSWORD = os.environ.get("LOGIN_PASSWORD") or "Neelan@123"
 
 today_str = datetime.now().strftime("%d-%m-%Y")
 new_filename = f"Fleet Dashboard {today_str}.xlsx"
@@ -31,8 +37,18 @@ if os.path.exists(final_path):
     os.remove(final_path)
     print(f"🗑️ Existing file deleted: {final_path}")
 
-DEBUG_DIR = "captcha_debug"
-os.makedirs(DEBUG_DIR, exist_ok=True)
+
+def fill_credentials(page):
+    """Fill username + password and verify they actually stuck (Angular form)."""
+    page.fill("input[name='UserName']", USERNAME)
+    page.fill("input[id='password']", PASSWORD)
+    # Verify - re-fill once if the value did not register
+    if not page.input_value("input[name='UserName']"):
+        page.locator("input[name='UserName']").click()
+        page.locator("input[name='UserName']").press_sequentially(USERNAME, delay=40)
+    if not page.input_value("input[id='password']"):
+        page.locator("input[id='password']").click()
+        page.locator("input[id='password']").press_sequentially(PASSWORD, delay=40)
 
 
 def main():
@@ -40,58 +56,52 @@ def main():
     reader = easyocr.Reader(['en'], gpu=False, verbose=False)
 
     with sync_playwright() as p:
-        # HEADED under Xvfb so the canvas captcha renders with real fonts
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=False)  # headed under Xvfb
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
         page.set_default_timeout(60_000)
 
         try:
-            # ── Login (exact working pattern) ──────────────────────
-            print("[LOGIN]  ...")
+            print("[LOGIN]  Opening login page...")
             page.goto("https://mtcbusits.in/")
-            page.fill("input[name='UserName']", USERNAME)
-            password = os.environ.get('LOGIN_PASSWORD', 'Neelan@123')
-            page.fill("input[id='password']", password)
+            page.wait_for_load_state("networkidle")
 
             logged_in = False
-            for attempt in range(15):
+            for attempt in range(1, 21):
+                # Always (re-)fill credentials in case a refresh/reload cleared them
+                fill_credentials(page)
+
+                # Read captcha from the single data:image on the page
                 captcha_img_src = page.get_attribute('img[src^="data:image"]', "src")
                 if captcha_img_src and captcha_img_src.startswith("data:image"):
-                    # Save the image so it can be inspected from the artifact if needed
-                    if attempt < 3:
-                        try:
-                            with open(os.path.join(DEBUG_DIR, f"captcha_attempt{attempt+1}.png"), "wb") as f:
-                                f.write(base64.b64decode(captcha_img_src.split(",")[1]))
-                        except Exception:
-                            pass
                     image_data = base64.b64decode(captcha_img_src.split(",")[1])
                     result = reader.readtext(image_data, detail=0, mag_ratio=2)
                     captcha = re.sub(r'[^A-Za-z0-9]', '', "".join(result).strip())
-                    print(f"[LOGIN]  CAPTCHA via OCR (attempt {attempt+1}/15): {captcha}")
                 else:
-                    captcha = page.inner_text("span.input-group-addon").strip()
-                    captcha = re.sub(r'[^A-Za-z0-9]', '', captcha)
-                    print(f"[LOGIN]  CAPTCHA via text (attempt {attempt+1}/15): {captcha}")
+                    captcha = re.sub(r'[^A-Za-z0-9]', '', page.inner_text("span.input-group-addon").strip())
+
+                u_ok = bool(page.input_value("input[name='UserName']"))
+                p_ok = bool(page.input_value("input[id='password']"))
+                print(f"[LOGIN]  Attempt {attempt}/20 | user_filled={u_ok} pass_filled={p_ok} | captcha='{captcha}'")
 
                 page.fill("input[formcontrolname='captcha']", captcha)
                 page.click("button:has-text('Login')")
 
-                # Wait up to 10s for URL to change to confirm login
+                # Wait up to 10s for the URL to leave the login page
                 for _ in range(50):
                     page.wait_for_timeout(200)
-                    if "login" not in page.url and page.url != "https://mtcbusits.in/":
+                    if "login" not in page.url and page.url.rstrip("/") != "https://mtcbusits.in":
                         break
 
-                if "login" not in page.url and page.url != "https://mtcbusits.in/":
-                    print("[LOGIN]  Successfully logged in!")
+                if "login" not in page.url and page.url.rstrip("/") != "https://mtcbusits.in":
+                    print(f"[LOGIN]  ✅ Successfully logged in on attempt {attempt}! URL={page.url}")
                     logged_in = True
                     break
 
-                print(f"[LOGIN]  OCR guessed wrong (attempt {attempt+1}/15). Retrying...")
+                print(f"[LOGIN]  ❌ Attempt {attempt}/20 rejected. Refreshing captcha...")
                 try:
                     old_src = captcha_img_src
-                    page.locator(".k-i-reload").click(timeout=1000)
+                    page.locator(".k-i-reload").click(timeout=1500)
                     for _ in range(25):
                         page.wait_for_timeout(200)
                         new_src = page.get_attribute('img[src^="data:image"]', "src")
@@ -101,7 +111,7 @@ def main():
                     pass
 
             if not logged_in:
-                raise Exception("All 15 login attempts failed - check credentials")
+                raise Exception("All 20 login attempts failed")
 
             # ── Navigate to AVLS ──────────────────────────────────
             print("[NAV]    Navigating to AVLS section...")
@@ -129,7 +139,7 @@ def main():
                 export_button.click()
 
             download_info.value.save_as(final_path)
-            print(f"[SAVED]  {final_path}")
+            print(f"[SAVED]  ✅ {final_path}")
 
         except Exception as e:
             try:
